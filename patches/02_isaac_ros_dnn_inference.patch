@@ -1,0 +1,277 @@
+diff --git a/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/CMakeLists.txt b/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/CMakeLists.txt
+index 1a3a807..04c06c4 100644
+--- a/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/CMakeLists.txt
++++ b/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/CMakeLists.txt
+@@ -39,6 +39,8 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
+ 
+ target_link_libraries(${PROJECT_NAME}
+   CUDA::cudart
++  TENSORRT::nvinfer
++  TENSORRT::nvinfer_plugin
+   TENSORRT::nvonnxparser
+   yaml-cpp
+ )
+diff --git a/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/gxf/extensions/tensor_rt/tensor_rt_inference.cpp b/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/gxf/extensions/tensor_rt/tensor_rt_inference.cpp
+index 299fce8..53d52c8 100644
+--- a/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/gxf/extensions/tensor_rt/tensor_rt_inference.cpp
++++ b/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/gxf/extensions/tensor_rt/tensor_rt_inference.cpp
+@@ -305,16 +305,48 @@ gxf_result_t TensorRtInference::start() {
+     return GXF_FAILURE;
+   }
+ 
+-  // Deserialize the CUDA engine
++  // Deserialize the CUDA engine (TRT 10 removed the 3rd plugin-factory arg)
+   if (verbose_.get()) { GXF_LOG_INFO("Creating inference runtime."); }
+-  cuda_engine_.reset(infer_runtime_->deserializeCudaEngine(plan.data(), plan.size(), NULL));
++  cuda_engine_.reset(infer_runtime_->deserializeCudaEngine(plan.data(), plan.size()));
+ 
+-  // Debug spews
++  // If deserialization fails (e.g., TRT version mismatch), rebuild from ONNX and retry once.
++  if (!cuda_engine_) {
++    GXF_LOG_WARNING(
++        "Failed to deserialize CUDA engine from %s (possible TRT version mismatch). "
++        "Rebuilding from ONNX model %s ...",
++        engine_file_path_.get().c_str(), model_file_path_.get().c_str());
++    std::remove(engine_file_path_.get().c_str());
++    auto rebuild_result = convertModelToEngine();
++    if (!rebuild_result) {
++      GXF_LOG_ERROR("Failed to rebuild engine from ONNX model %s.",
++                    model_file_path_.get().c_str());
++      return gxf::ToResultCode(rebuild_result);
++    }
++    plan = std::move(rebuild_result.value());
++    if (!SerializeEnginePlan(plan, engine_file_path_.get())) {
++      GXF_LOG_WARNING("Engine plan serialization failed after rebuild. Using in-memory plan.");
++    }
++    // Re-create runtime and deserialize the freshly built plan
++    infer_runtime_.reset(nvinfer1::createInferRuntime(cuda_logger_));
++    if (!infer_runtime_) {
++      GXF_LOG_ERROR("Unable to create runtime after rebuild.");
++      return GXF_FAILURE;
++    }
++    cuda_engine_.reset(infer_runtime_->deserializeCudaEngine(plan.data(), plan.size()));
++    if (!cuda_engine_) {
++      GXF_LOG_ERROR("Failed to deserialize freshly-built CUDA engine.");
++      return GXF_FAILURE;
++    }
++    GXF_LOG_INFO("Successfully rebuilt and loaded CUDA engine from ONNX.");
++  }
++
++  // Debug spews (TRT 10: getNbBindings/getBindingName → getNbIOTensors/getIOTensorName)
+   if (verbose_.get()) {
+-    GXF_LOG_INFO("Number of CUDA bindings: %d", cuda_engine_->getNbBindings());
+-    for (int i = 0; i < cuda_engine_->getNbBindings(); ++i) {
+-      GXF_LOG_INFO("CUDA binding No.%d: name %s Format %s", i, cuda_engine_->getBindingName(i),
+-                    cuda_engine_->getBindingFormatDesc(i));
++    GXF_LOG_INFO("Number of CUDA bindings: %d", cuda_engine_->getNbIOTensors());
++    for (int i = 0; i < cuda_engine_->getNbIOTensors(); ++i) {
++      const char* tname = cuda_engine_->getIOTensorName(i);
++      GXF_LOG_INFO("CUDA binding No.%d: name %s Format %s", i, tname,
++                    cuda_engine_->getTensorFormatDesc(tname));
+     }
+   }
+ 
+@@ -322,11 +354,11 @@ gxf_result_t TensorRtInference::start() {
+   const uint64_t input_number = input_tensor_names_.get().size();
+   const uint64_t output_number = output_tensor_names_.get().size();
+   const int64_t total_bindings_number = input_number + output_number;
+-  if (cuda_engine_->getNbBindings() != static_cast<int>(total_bindings_number)) {
++  if (cuda_engine_->getNbIOTensors() != static_cast<int>(total_bindings_number)) {
+     GXF_LOG_ERROR(
+         "Numbers of CUDA bindings mismatch: configured for %lu vs model requires %d. "
+         "Please check TensorRTInference codelet configuration.\n",
+-        total_bindings_number, cuda_engine_->getNbBindings());
++        total_bindings_number, cuda_engine_->getNbIOTensors());
+     return GXF_ARGUMENT_INVALID;
+   }
+ 
+@@ -338,35 +370,26 @@ gxf_result_t TensorRtInference::start() {
+                        nullptr);
+ 
+   // Keeps record of input bindings
++  // TRT 10 removed index-based APIs; use tensor name directly and assign sequential indices.
+   binding_infos_.clear();
+   for (uint64_t j = 0; j < input_number; ++j) {
+     const std::string& tensor_name = input_tensor_names_.get()[j];
+     const std::string& binding_name = input_binding_names_.get()[j];
+ 
+-    const int32_t binding_index = cuda_engine_->getBindingIndex(binding_name.c_str());
+-    if (binding_index == -1) {
+-      GXF_LOG_ERROR("Failed to get binding index for input %s in model %s", binding_name.c_str(),
+-                    engine_file_path_.get().c_str());
+-      return GXF_FAILURE;
+-    }
++    const int32_t binding_index = static_cast<int32_t>(j);
+ 
+-    if (binding_index >= static_cast<int>(cuda_buffers_.size())) {
+-      GXF_LOG_ERROR("Binding index for input %s is out of range in model %s.", binding_name.c_str(),
+-                    engine_file_path_.get().c_str());
+-      return GXF_FAILURE;
+-    }
+-
+-    // Checks element type
++    // Checks element type (TRT 10: getTensorDataType by name)
+     const auto maybe_element_type =
+-        NvInferDatatypeToTensorElementType(cuda_engine_->getBindingDataType(binding_index));
++        NvInferDatatypeToTensorElementType(
++            cuda_engine_->getTensorDataType(binding_name.c_str()));
+     if (!maybe_element_type) {
+       GXF_LOG_ERROR("Unsupported element type for binding input %s on index %d. ",
+                     binding_name.c_str(), binding_index);
+       return maybe_element_type.error();
+     }
+ 
+-    // Keeps binding info
+-    const auto& dims = cuda_engine_->getBindingDimensions(binding_index);
++    // Keeps binding info (TRT 10: getTensorShape by name)
++    const nvinfer1::Dims dims = cuda_engine_->getTensorShape(binding_name.c_str());
+     binding_infos_[tensor_name] =
+         BindingInfo{binding_index, static_cast<uint32_t>(dims.nbDims), binding_name,
+                     maybe_element_type.value(), Dims2Dimensions(dims)};
+@@ -386,27 +409,20 @@ gxf_result_t TensorRtInference::start() {
+     const std::string& tensor_name = output_tensor_names_.get()[j];
+     const std::string& binding_name = output_binding_names_.get()[j];
+ 
+-    const int32_t binding_index = cuda_engine_->getBindingIndex(binding_name.c_str());
+-    if (binding_index == -1) {
+-      GXF_LOG_ERROR("Failed to get binding index for output %s", binding_name.c_str());
+-      return GXF_FAILURE;
+-    }
+-    if (binding_index >= static_cast<int>(cuda_buffers_.size())) {
+-      GXF_LOG_ERROR("Binding index for output %s is out of range.", binding_name.c_str());
+-      return GXF_FAILURE;
+-    }
++    const int32_t binding_index = static_cast<int32_t>(input_number + j);
+ 
+-    // Checks element type
++    // Checks element type (TRT 10: getTensorDataType by name)
+     const auto maybe_element_type =
+-        NvInferDatatypeToTensorElementType(cuda_engine_->getBindingDataType(binding_index));
++        NvInferDatatypeToTensorElementType(
++            cuda_engine_->getTensorDataType(binding_name.c_str()));
+     if (!maybe_element_type) {
+       GXF_LOG_ERROR("Unsupported element type for binding output %s on index %d. ",
+                     binding_name.c_str(), binding_index);
+       return maybe_element_type.error();
+     }
+ 
+-    // Keeps binding info
+-    const auto& dims = cuda_engine_->getBindingDimensions(binding_index);
++    // Keeps binding info (TRT 10: getTensorShape by name)
++    const nvinfer1::Dims dims = cuda_engine_->getTensorShape(binding_name.c_str());
+     binding_infos_[tensor_name] =
+         BindingInfo{binding_index, static_cast<uint32_t>(dims.nbDims), binding_name,
+                     maybe_element_type.value(), Dims2Dimensions(dims)};
+@@ -449,8 +465,10 @@ gxf::Expected<std::vector<char>> TensorRtInference::convertModelToEngine() {
+   NvInferHandle<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(cuda_logger_));
+ 
+   // Builder Config provides options to the Builder
++  // TRT 10: setMaxWorkspaceSize → setMemoryPoolLimit(kWORKSPACE, ...)
+   NvInferHandle<nvinfer1::IBuilderConfig> builderConfig(builder->createBuilderConfig());
+-  builderConfig->setMaxWorkspaceSize(max_workspace_size_);
++  builderConfig->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE,
++                                    static_cast<size_t>(max_workspace_size_));
+ 
+   // Sets DLA core if provided and always fall back to GPU
+   auto dla_core = dla_core_.try_get();
+@@ -512,16 +530,12 @@ gxf::Expected<std::vector<char>> TensorRtInference::convertModelToEngine() {
+   builderConfig->addOptimizationProfile(optimization_profile);
+ 
+   // Creates TensorRT Engine Plan
+-  NvInferHandle<nvinfer1::ICudaEngine> engine(
+-      builder->buildEngineWithConfig(*network, *builderConfig));
+-  if (!engine) {
+-    GXF_LOG_ERROR("Failed to build TensorRT engine from model %s.", model_file_path_.get().c_str());
+-    return gxf::Unexpected{GXF_FAILURE};
+-  }
+-
+-  NvInferHandle<nvinfer1::IHostMemory> model_stream(engine->serialize());
++  // TRT 10: buildEngineWithConfig removed → buildSerializedNetwork returns plan directly
++  NvInferHandle<nvinfer1::IHostMemory> model_stream(
++      builder->buildSerializedNetwork(*network, *builderConfig));
+   if (!model_stream || model_stream->size() == 0 || model_stream->data() == nullptr) {
+-    GXF_LOG_ERROR("Fail to serialize TensorRT Engine.");
++    GXF_LOG_ERROR("Failed to build/serialize TensorRT engine from model %s.",
++                  model_file_path_.get().c_str());
+     return gxf::Unexpected{GXF_FAILURE};
+   }
+ 
+@@ -654,7 +668,8 @@ gxf_result_t TensorRtInference::tick() {
+     }
+ 
+     // Updates the latest dimension of input tensor
+-    if (!cuda_execution_ctx_->setBindingDimensions(binding_info.index, dims)) {
++    // TRT 10: setBindingDimensions(index, dims) → setInputShape(name, dims)
++    if (!cuda_execution_ctx_->setInputShape(binding_info.binding_name.c_str(), dims)) {
+       GXF_LOG_ERROR("Failed to update input binding %s dimensions.",
+                     binding_info.binding_name.c_str());
+       return GXF_FAILURE;
+@@ -678,14 +693,16 @@ gxf_result_t TensorRtInference::tick() {
+     }
+ 
+     // Queries binding dimension from context and allocates tensor accordingly
++    // TRT 10: getBindingDimensions(index) → getTensorShape(name)
+     const auto& binding_info = binding_infos_[tensor_name];
+-    const auto binding_dims = cuda_engine_->getBindingDimensions(binding_info.index);
++    const nvinfer1::Dims binding_dims =
++        cuda_engine_->getTensorShape(binding_info.binding_name.c_str());
+ 
+     auto dimensions = Dims2Dimensions(binding_dims);
+     for (int i = 0; i < binding_dims.nbDims; i++) {
+       if (dimensions[i] < 0) { dimensions[i] = max_batch_size_.get(); }
+     }
+-    gxf::Shape shape{dimensions, binding_info.rank};
++    gxf::Shape shape(dimensions, binding_info.rank);
+ 
+     auto result = maybe_result_tensor.value()->reshapeCustom(
+         shape, binding_info.element_type, gxf::PrimitiveTypeSize(binding_info.element_type),
+@@ -707,9 +724,16 @@ gxf_result_t TensorRtInference::tick() {
+   maybe_stream_id.value()->stream_cid = cuda_stream_.cid();
+   GXF_ASSERT(maybe_stream_id.value()->stream_cid != kNullUid, "Internal error: stream_cid is null");
+ 
+-  // Runs inference on specified CUDA stream
+-  if (!cuda_execution_ctx_->enqueueV2(cuda_buffers_.data(), cached_cuda_stream_,
+-                                      &cuda_event_consumed_)) {
++  // TRT 10: enqueueV2(buffers[], stream, event) → set addresses per tensor + enqueueV3(stream)
++  for (const auto& tname : input_tensor_names_.get()) {
++    const auto& bi = binding_infos_[tname];
++    cuda_execution_ctx_->setTensorAddress(bi.binding_name.c_str(), cuda_buffers_[bi.index]);
++  }
++  for (const auto& tname : output_tensor_names_.get()) {
++    const auto& bi = binding_infos_[tname];
++    cuda_execution_ctx_->setTensorAddress(bi.binding_name.c_str(), cuda_buffers_[bi.index]);
++  }
++  if (!cuda_execution_ctx_->enqueueV3(cached_cuda_stream_)) {
+     GXF_LOG_ERROR("TensorRT task enqueue for engine %s failed.", engine_file_path_.get().c_str());
+     return GXF_FAILURE;
+   }
+diff --git a/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/gxf/extensions/tensor_rt/tensor_rt_inference.hpp b/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/gxf/extensions/tensor_rt/tensor_rt_inference.hpp
+index d7f2f54..fa53714 100644
+--- a/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/gxf/extensions/tensor_rt/tensor_rt_inference.hpp
++++ b/isaac_ros_gxf_extensions/gxf_isaac_tensor_rt/gxf/extensions/tensor_rt/tensor_rt_inference.hpp
+@@ -67,10 +67,10 @@ class TensorRtInference : public gxf::Codelet {
+   gxf_result_t registerInterface(gxf::Registrar* registrar) override;
+ 
+  private:
+-  // Helper deleter to call destroy while destroying the cuda objects
++  // Helper deleter for TRT objects (TRT 10 removed destroy(), use delete instead)
+   template <typename T>
+   struct DeleteFunctor {
+-    inline void operator()(void* ptr) { reinterpret_cast<T*>(ptr)->destroy(); }
++    inline void operator()(void* ptr) { delete reinterpret_cast<T*>(ptr); }
+   };
+   // unique_ptr using custom Delete Functor above
+   template <typename T>
+diff --git a/isaac_ros_tensor_rt/src/tensor_rt_node.cpp b/isaac_ros_tensor_rt/src/tensor_rt_node.cpp
+index f6f6c54..7e13c32 100644
+--- a/isaac_ros_tensor_rt/src/tensor_rt_node.cpp
++++ b/isaac_ros_tensor_rt/src/tensor_rt_node.cpp
+@@ -290,7 +290,7 @@ size_t TensorRTNode::determineMaxTensorBlockSize()
+ 
+     uint64_t tensor_element_count = 1;
+     for (int j = 0; j < shape.nbDims; j++) {
+-      tensor_element_count *= std::max(shape.d[j], 1);
++      tensor_element_count *= std::max(shape.d[j], static_cast<int64_t>(1));
+     }
+ 
+     uint64_t bytes_per_element;

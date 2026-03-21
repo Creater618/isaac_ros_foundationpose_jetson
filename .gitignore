@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+install/
+log/
+*.plan
+*.pth
+*.zip
+*.tar.gz
+*.deb
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp

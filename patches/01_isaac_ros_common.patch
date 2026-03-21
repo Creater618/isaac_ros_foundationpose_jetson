@@ -1,0 +1,60 @@
+diff --git a/isaac_ros_common/cmake/modules/FindTENSORRT.cmake b/isaac_ros_common/cmake/modules/FindTENSORRT.cmake
+index 6844bbe..14e163d 100644
+--- a/isaac_ros_common/cmake/modules/FindTENSORRT.cmake
++++ b/isaac_ros_common/cmake/modules/FindTENSORRT.cmake
+@@ -33,18 +33,19 @@
+ find_path(TENSORRT_INCLUDE_DIR NAMES NvInferVersion.h REQUIRED)
+ mark_as_advanced(TENSORRT_INCLUDE_DIR)
+ 
+-# Find version
+-function(read_version name str)
+-    string(REGEX MATCH "${name} ([0-9]\\d*)" _ ${str})
+-    set(${name} ${CMAKE_MATCH_1} PARENT_SCOPE)
+-endfunction()
+-
+-file(READ "${TENSORRT_INCLUDE_DIR}/NvInferVersion.h" _TRT_VERSION_FILE)
+-read_version(NV_TENSORRT_MAJOR ${_TRT_VERSION_FILE})
+-read_version(NV_TENSORRT_MINOR ${_TRT_VERSION_FILE})
+-read_version(NV_TENSORRT_PATCH ${_TRT_VERSION_FILE})
++# Find version - use file(STRINGS) for reliable line-by-line parsing (works on TRT 8 and 10)
++file(STRINGS "${TENSORRT_INCLUDE_DIR}/NvInferVersion.h" _TRT_VERSION_LINES)
++foreach(_line ${_TRT_VERSION_LINES})
++    if(_line MATCHES "#define NV_TENSORRT_MAJOR ([0-9]+)")
++        set(NV_TENSORRT_MAJOR ${CMAKE_MATCH_1})
++    elseif(_line MATCHES "#define NV_TENSORRT_MINOR ([0-9]+)")
++        set(NV_TENSORRT_MINOR ${CMAKE_MATCH_1})
++    elseif(_line MATCHES "#define NV_TENSORRT_PATCH ([0-9]+)")
++        set(NV_TENSORRT_PATCH ${CMAKE_MATCH_1})
++    endif()
++endforeach()
++unset(_TRT_VERSION_LINES)
+ set(TENSORRT_VERSION "${NV_TENSORRT_MAJOR}.${NV_TENSORRT_MINOR}.${NV_TENSORRT_PATCH}")
+-unset(_TRT_VERSION_FILE)
+ 
+ # Find libs, and create the imported target
+ macro(find_trt_library libname)
+@@ -59,9 +60,22 @@ endmacro()
+ 
+ find_trt_library(nvinfer)
+ find_trt_library(nvinfer_plugin)
+-find_trt_library(nvcaffe_parser)
+ find_trt_library(nvonnxparser)
+-find_trt_library(nvparsers)
++# nvcaffe_parser and nvparsers were removed in TensorRT 10 - skip if not found
++find_library(TENSORRT_nvcaffe_parser_LIBRARY NAMES nvcaffe_parser)
++if(TENSORRT_nvcaffe_parser_LIBRARY)
++  add_library(TENSORRT::nvcaffe_parser SHARED IMPORTED GLOBAL)
++  set_target_properties(TENSORRT::nvcaffe_parser PROPERTIES
++    IMPORTED_LOCATION "${TENSORRT_nvcaffe_parser_LIBRARY}"
++    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${TENSORRT_INCLUDE_DIR}")
++endif()
++find_library(TENSORRT_nvparsers_LIBRARY NAMES nvparsers)
++if(TENSORRT_nvparsers_LIBRARY)
++  add_library(TENSORRT::nvparsers SHARED IMPORTED GLOBAL)
++  set_target_properties(TENSORRT::nvparsers PROPERTIES
++    IMPORTED_LOCATION "${TENSORRT_nvparsers_LIBRARY}"
++    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${TENSORRT_INCLUDE_DIR}")
++endif()
+ 
+ # Generate TENSORRT_FOUND
+ include(FindPackageHandleStandardArgs)

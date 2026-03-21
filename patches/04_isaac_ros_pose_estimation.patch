@@ -1,0 +1,680 @@
+diff --git a/isaac_ros_foundationpose/CMakeLists.txt b/isaac_ros_foundationpose/CMakeLists.txt
+index 991614d..58d4a59 100644
+--- a/isaac_ros_foundationpose/CMakeLists.txt
++++ b/isaac_ros_foundationpose/CMakeLists.txt
+@@ -75,4 +75,9 @@ if(BUILD_TESTING)
+   add_launch_test(test/isaac_ros_foundationpose_tracking_pol.py TIMEOUT "900")
+ endif()
+ 
++install(PROGRAMS
++  scripts/yolo_fp_bridge.py
++  DESTINATION lib/${PROJECT_NAME}
++)
++
+ ament_auto_package(INSTALL_TO_SHARE config launch rviz)
+diff --git a/isaac_ros_foundationpose/include/isaac_ros_foundationpose/foundationpose_node.hpp b/isaac_ros_foundationpose/include/isaac_ros_foundationpose/foundationpose_node.hpp
+index 166a78b..79a8603 100644
+--- a/isaac_ros_foundationpose/include/isaac_ros_foundationpose/foundationpose_node.hpp
++++ b/isaac_ros_foundationpose/include/isaac_ros_foundationpose/foundationpose_node.hpp
+@@ -18,8 +18,10 @@
+ #ifndef ISAAC_ROS_FOUNDATIONPOSE__FOUNDATIONPOSE_NODE_HPP_
+ #define ISAAC_ROS_FOUNDATIONPOSE__FOUNDATIONPOSE_NODE_HPP_
+ 
++#include <mutex>
+ #include <string>
+ #include <vector>
++#include <std_msgs/msg/string.hpp>
+ #include <vision_msgs/msg/detection3_d_array.hpp>
+ 
+ #include "isaac_ros_nitros/nitros_node.hpp"
+@@ -60,8 +62,8 @@ private:
+   float rot_normalizer_;
+ 
+   // Path to the mesh files
+-  const std::string mesh_file_path_;
+-  const std::string texture_path_;
++  std::string mesh_file_path_;
++  std::string texture_path_;
+ 
+   const float min_depth_;
+   const float max_depth_;
+@@ -86,6 +88,24 @@ private:
+   const StringList score_output_binding_names_;
+ 
+   const std::string tf_frame_name_;
++
++  void modelIdCallback(const std_msgs::msg::String::ConstSharedPtr msg);
++  void applyModelPaths(const std::string & mesh_file_path, const std::string & texture_path);
++
++  // Switch mesh/texture based on YOLO model_id.
++  std::string model_id_topic_;
++  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr model_id_sub_;
++  std::string k2_mesh_file_path_;
++  std::string k2_texture_path_;
++  std::string j2_mesh_file_path_;
++  std::string j2_texture_path_;
++  std::string other_mesh_file_path_;
++  std::string other_texture_path_;
++
++  bool graph_ready_ = false;
++  std::string pending_mesh_file_path_;
++  std::string pending_texture_path_;
++  std::mutex model_update_mutex_;
+ };
+ 
+ }  // namespace foundationpose
+diff --git a/isaac_ros_foundationpose/include/isaac_ros_foundationpose/foundationpose_tracking_node.hpp b/isaac_ros_foundationpose/include/isaac_ros_foundationpose/foundationpose_tracking_node.hpp
+index 99df039..dac4621 100644
+--- a/isaac_ros_foundationpose/include/isaac_ros_foundationpose/foundationpose_tracking_node.hpp
++++ b/isaac_ros_foundationpose/include/isaac_ros_foundationpose/foundationpose_tracking_node.hpp
+@@ -18,8 +18,10 @@
+ #ifndef ISAAC_ROS_FOUNDATIONPOSE__FOUNDATIONPOSE_TRACKING_NODE_HPP_
+ #define ISAAC_ROS_FOUNDATIONPOSE__FOUNDATIONPOSE_TRACKING_NODE_HPP_
+ 
++#include <mutex>
+ #include <string>
+ #include <vector>
++#include <std_msgs/msg/string.hpp>
+ #include <vision_msgs/msg/detection3_d_array.hpp>
+ 
+ #include "isaac_ros_nitros/nitros_node.hpp"
+@@ -50,6 +52,9 @@ public:
+   void FoundationPoseTrackingCallback(const gxf_context_t context, nitros::NitrosTypeBase & msg);
+ 
+ private:
++  void modelIdCallback(const std_msgs::msg::String::ConstSharedPtr msg);
++  void applyModelPaths(const std::string & mesh_file_path, const std::string & texture_path);
++
+   // The name of the YAML configuration file
+   const std::string configuration_file_;
+   uint32_t resized_image_width_;
+@@ -58,8 +63,8 @@ private:
+   float rot_normalizer_;
+ 
+   // Path to the mesh files
+-  const std::string mesh_file_path_;
+-  const std::string texture_path_;
++  std::string mesh_file_path_;
++  std::string texture_path_;
+ 
+   const float min_depth_;
+   const float max_depth_;
+@@ -77,6 +82,29 @@ private:
+   const StringList refine_output_binding_names_;
+ 
+   const std::string tf_frame_name_;
++
++  // One-shot formatted pose output for external (non-TF) consumers.
++  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr xyzrpy_pub_;
++  const std::string xyzrpy_topic_;
++  const int xyzrpy_precision_;
++
++  // Dynamically switch mesh/texture based on YOLO model_id (e.g. k2/j2/other).
++  std::string model_id_topic_;
++  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr model_id_sub_;
++
++  // Optional model-to-asset mapping (set via launch/parameters).
++  std::string k2_mesh_file_path_;
++  std::string k2_texture_path_;
++  std::string j2_mesh_file_path_;
++  std::string j2_texture_path_;
++  std::string other_mesh_file_path_;
++  std::string other_texture_path_;
++
++  // Guard to ensure graph context is ready before applying runtime updates.
++  bool graph_ready_ = false;
++  std::string pending_mesh_file_path_;
++  std::string pending_texture_path_;
++  std::mutex model_update_mutex_;
+ };
+ 
+ }  // namespace foundationpose
+diff --git a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_hawk_tracking.launch.py b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_hawk_tracking.launch.py
+index e0a91d2..d39deee 100644
+--- a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_hawk_tracking.launch.py
++++ b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_hawk_tracking.launch.py
+@@ -436,7 +436,8 @@ def generate_launch_description():
+         package='isaac_ros_foundationpose',
+         plugin='nvidia::isaac_ros::foundationpose::Selector',
+         parameters=[{
+-            'reset_period': 10000
++            'reset_period': 10000,
++            'enable_service_trigger': True
+         }],
+         remappings=[
+             ('depth_image', 'depth_image'),
+diff --git a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_isaac_sim_tracking.launch.py b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_isaac_sim_tracking.launch.py
+index 6ab3c1a..154a633 100644
+--- a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_isaac_sim_tracking.launch.py
++++ b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_isaac_sim_tracking.launch.py
+@@ -351,7 +351,8 @@ def generate_launch_description():
+         package='isaac_ros_foundationpose',
+         plugin='nvidia::isaac_ros::foundationpose::Selector',
+         parameters=[{
+-            'reset_period': 5000
++            'reset_period': 5000,
++            'enable_service_trigger': True
+         }],
+         remappings=[
+             ('depth_image', 'depth_image'),
+diff --git a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_realsense_tracking.launch.py b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_realsense_tracking.launch.py
+index 6ce4a0b..5f31400 100644
+--- a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_realsense_tracking.launch.py
++++ b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_realsense_tracking.launch.py
+@@ -353,7 +353,8 @@ def generate_launch_description():
+         package='isaac_ros_foundationpose',
+         plugin='nvidia::isaac_ros::foundationpose::Selector',
+         parameters=[{
+-            'reset_period': 10000
++            'reset_period': 10000,
++            'enable_service_trigger': True
+         }],
+         remappings=[
+             ('depth_image', 'depth_image'),
+diff --git a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_tracking.launch.py b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_tracking.launch.py
+index 33098a6..67c7eb8 100644
+--- a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_tracking.launch.py
++++ b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_tracking.launch.py
+@@ -96,8 +96,8 @@ def generate_launch_description():
+         package='isaac_ros_foundationpose',
+         plugin='nvidia::isaac_ros::foundationpose::Selector',
+         parameters=[{
+-             # Expect to reset after the rosbag play complete
+-            'reset_period': 65000
++            'reset_period': 65000,
++            'enable_service_trigger': True
+         }])
+ 
+     foundationpose_node = ComposableNode(
+@@ -131,8 +131,8 @@ def generate_launch_description():
+             'mesh_file_path': mesh_file_path,
+             'texture_path': texture_path,
+ 
+-            'refine_model_file_path': REFINE_MODEL_NAME,
+-            'refine_engine_file_path': REFINE_ENGINE_NAME,
++            'refine_model_file_path': refine_model_file_path,
++            'refine_engine_file_path': refine_engine_file_path,
+             'refine_input_tensor_names': ['input_tensor1', 'input_tensor2'],
+             'refine_input_binding_names': ['input1', 'input2'],
+             'refine_output_tensor_names': ['output_tensor1', 'output_tensor2'],
+@@ -151,10 +151,17 @@ def generate_launch_description():
+         namespace='',
+         package='rclcpp_components',
+         executable='component_container_mt',
+-        composable_node_descriptions=[selector_node, foundationpose_node,
+-                                      foundationpose_tracking_node],
++        composable_node_descriptions=[
++            selector_node,
++            foundationpose_node,
++            foundationpose_tracking_node,
++        ],
+         output='screen'
+     )
+ 
+-    return launch.LaunchDescription(launch_args + [foundationpose_container,
+-                                                   rviz_node])
++    return launch.LaunchDescription(
++        launch_args + [
++            foundationpose_container,
++            rviz_node,
++        ]
++    )
+diff --git a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_tracking_core.launch.py b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_tracking_core.launch.py
+index 4ac9547..407cfba 100644
+--- a/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_tracking_core.launch.py
++++ b/isaac_ros_foundationpose/launch/isaac_ros_foundationpose_tracking_core.launch.py
+@@ -222,7 +222,8 @@ class IsaacROSFoundationPoseTrackingLaunchFragment(IsaacROSLaunchFragment):
+                 plugin='nvidia::isaac_ros::foundationpose::Selector',
+                 parameters=[{
+                     # Expect to reset after the rosbag play complete
+-                    'reset_period': 65000
++                    'reset_period': 65000,
++                    'enable_service_trigger': True
+                 }],
+                 remappings=[
+                     ('image', 'image_rect'),
+diff --git a/isaac_ros_foundationpose/package.xml b/isaac_ros_foundationpose/package.xml
+index 2bb192a..fb4d9b1 100644
+--- a/isaac_ros_foundationpose/package.xml
++++ b/isaac_ros_foundationpose/package.xml
+@@ -39,14 +39,20 @@
+   <depend>isaac_ros_nitros</depend>
+   <depend>isaac_ros_nitros_camera_info_type</depend>
+   <depend>isaac_ros_nitros_detection3_d_array_type</depend>
++  <depend>isaac_ros_nitros_image_type</depend>
++  <depend>isaac_ros_nitros_tensor_list_type</depend>
+   <depend>isaac_ros_tensor_list_interfaces</depend>
+   <depend>isaac_ros_nitros_point_cloud_type</depend>
+ 
++  <depend>std_msgs</depend>
++  <depend>std_srvs</depend>
++
+   <depend>message_filters</depend>
+   <depend>rclcpp</depend>
+   <depend>sensor_msgs</depend>
+   <depend>vision_msgs</depend>
+   <depend>assimp</depend>
++  <depend>tf2</depend>
+   <depend>tf2_eigen</depend>
+ 
+   <build_depend>gxf_isaac_gems</build_depend>
+@@ -57,7 +63,7 @@
+   <exec_depend>gxf_isaac_foundationpose</exec_depend>
+   <exec_depend>isaac_ros_stereo_image_proc</exec_depend>
+   <exec_depend>isaac_ros_depth_image_proc</exec_depend>
+-  <exec_depend>isaac_ros_managed_nitros</exec_depend>
++  <depend>isaac_ros_managed_nitros</depend>
+   <exec_depend>isaac_ros_tensor_rt</exec_depend>
+   <exec_depend>isaac_ros_nitros_topic_tools</exec_depend>
+   <exec_depend>isaac_ros_image_proc</exec_depend>
+diff --git a/isaac_ros_foundationpose/src/foundationpose_node.cpp b/isaac_ros_foundationpose/src/foundationpose_node.cpp
+index 5c580eb..1fbb5f7 100644
+--- a/isaac_ros_foundationpose/src/foundationpose_node.cpp
++++ b/isaac_ros_foundationpose/src/foundationpose_node.cpp
+@@ -17,6 +17,9 @@
+ 
+ #include <filesystem>
+ 
++#include <algorithm>
++#include <cctype>
++
+ #include "ament_index_cpp/get_package_share_directory.hpp"
+ #include "detection3_d_array_message/detection3_d_array_message.hpp"
+ #include "geometry_msgs/msg/transform_stamped.hpp"
+@@ -176,6 +179,19 @@ FoundationPoseNode::FoundationPoseNode(rclcpp::NodeOptions options)
+ {
+   RCLCPP_DEBUG(get_logger(), "[FoundationPoseNode] Constructor");
+ 
++  // Subscribe to YOLO model id so we can switch mesh/texture (obj) dynamically.
++  model_id_topic_ = this->declare_parameter<std::string>("model_id_topic", "/yolo_model_id");
++  k2_mesh_file_path_ = this->declare_parameter<std::string>("k2_mesh_file_path", "");
++  k2_texture_path_ = this->declare_parameter<std::string>("k2_texture_path", "");
++  j2_mesh_file_path_ = this->declare_parameter<std::string>("j2_mesh_file_path", "");
++  j2_texture_path_ = this->declare_parameter<std::string>("j2_texture_path", "");
++  other_mesh_file_path_ = this->declare_parameter<std::string>("other_mesh_file_path", "");
++  other_texture_path_ = this->declare_parameter<std::string>("other_texture_path", "");
++
++  model_id_sub_ = this->create_subscription<std_msgs::msg::String>(
++    model_id_topic_, rclcpp::QoS(10),
++    std::bind(&FoundationPoseNode::modelIdCallback, this, std::placeholders::_1));
++
+   // Add callback function for FoundationPose Detection3D array to broadcast to ROS TF tree
+   config_map_[OUTPUT_POSE_COMPONENT_KEY].callback = std::bind(
+     &FoundationPoseNode::FoundationPoseDetectionCallback, this, std::placeholders::_1,
+@@ -387,6 +403,97 @@ void FoundationPoseNode::postLoadGraphCallback()
+   getNitrosContext().setParameter1DStrVector(
+     "score_inference", "nvidia::gxf::TensorRtInference", "output_binding_names",
+     score_output_binding_names_);
++
++  // Mark graph as ready and apply any model switch requested before this point.
++  std::string pending_mesh;
++  std::string pending_texture;
++  {
++    std::lock_guard<std::mutex> lock(model_update_mutex_);
++    graph_ready_ = true;
++    pending_mesh = pending_mesh_file_path_;
++    pending_texture = pending_texture_path_;
++    pending_mesh_file_path_.clear();
++    pending_texture_path_.clear();
++  }
++  if (!pending_mesh.empty() && !pending_texture.empty()) {
++    applyModelPaths(pending_mesh, pending_texture);
++  }
++}
++
++void FoundationPoseNode::modelIdCallback(
++  const std_msgs::msg::String::ConstSharedPtr msg)
++{
++  if (!msg) {
++    return;
++  }
++
++  std::string model_id = msg->data;
++  model_id.erase(0, model_id.find_first_not_of(" \t\n\r"));
++  model_id.erase(model_id.find_last_not_of(" \t\n\r") + 1);
++  std::transform(model_id.begin(), model_id.end(), model_id.begin(),
++                 [](unsigned char c) { return std::tolower(c); });
++
++  std::string mesh;
++  std::string texture;
++
++  {
++    std::lock_guard<std::mutex> lock(model_update_mutex_);
++    if (model_id == "k2" && !k2_mesh_file_path_.empty() && !k2_texture_path_.empty()) {
++      mesh = k2_mesh_file_path_;
++      texture = k2_texture_path_;
++    } else if (model_id == "j2" && !j2_mesh_file_path_.empty() && !j2_texture_path_.empty()) {
++      mesh = j2_mesh_file_path_;
++      texture = j2_texture_path_;
++    } else if (!other_mesh_file_path_.empty() && !other_texture_path_.empty()) {
++      mesh = other_mesh_file_path_;
++      texture = other_texture_path_;
++    } else {
++      mesh = mesh_file_path_;
++      texture = texture_path_;
++    }
++
++    if (!graph_ready_) {
++      if (pending_mesh_file_path_ != mesh || pending_texture_path_ != texture) {
++        pending_mesh_file_path_ = mesh;
++        pending_texture_path_ = texture;
++      }
++      return;
++    }
++  }
++
++  applyModelPaths(mesh, texture);
++}
++
++void FoundationPoseNode::applyModelPaths(
++  const std::string & new_mesh_file_path, const std::string & new_texture_path)
++{
++  if (new_mesh_file_path.empty() || new_texture_path.empty()) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> lock(model_update_mutex_);
++  if (new_mesh_file_path == mesh_file_path_ && new_texture_path == texture_path_) {
++    return;
++  }
++  mesh_file_path_ = new_mesh_file_path;
++  texture_path_ = new_texture_path;
++
++  // Update mesh/texture paths for render/transform/decoder blocks.
++  getNitrosContext().setParameterStr(
++    "render", "nvidia::isaac_ros::FoundationposeRender", "mesh_file_path", mesh_file_path_);
++  getNitrosContext().setParameterStr(
++    "render_score", "nvidia::isaac_ros::FoundationposeRender", "mesh_file_path", mesh_file_path_);
++  getNitrosContext().setParameterStr(
++    "render", "nvidia::isaac_ros::FoundationposeRender", "texture_path", texture_path_);
++  getNitrosContext().setParameterStr(
++    "render_score", "nvidia::isaac_ros::FoundationposeRender", "texture_path", texture_path_);
++
++  getNitrosContext().setParameterStr(
++    "decoder", "nvidia::isaac_ros::FoundationposeDecoder", "mesh_file_path", mesh_file_path_);
++
++  getNitrosContext().setParameterStr(
++    "transform", "nvidia::isaac_ros::FoundationposeTransformation", "mesh_file_path",
++    mesh_file_path_);
+ }
+ 
+ void FoundationPoseNode::FoundationPoseDetectionCallback(
+diff --git a/isaac_ros_foundationpose/src/foundationpose_selector_node.cpp b/isaac_ros_foundationpose/src/foundationpose_selector_node.cpp
+index 2081cd9..bcab797 100644
+--- a/isaac_ros_foundationpose/src/foundationpose_selector_node.cpp
++++ b/isaac_ros_foundationpose/src/foundationpose_selector_node.cpp
+@@ -20,6 +20,7 @@
+ #include <rclcpp/rclcpp.hpp>
+ #include <rclcpp_components/register_node_macro.hpp>
+ #include <rclcpp/time.hpp>
++#include <std_srvs/srv/trigger.hpp>
+ #include <sensor_msgs/msg/image.hpp>
+ #include <sensor_msgs/msg/camera_info.hpp>
+ 
+@@ -107,13 +108,45 @@ public:
+       this->create_subscription<isaac_ros_tensor_list_interfaces::msg::TensorList>(
+       "pose_estimation/pose_matrix_output", 1, std::bind(&Selector::poseResetCallback, this, _1));
+ 
+-    // reset period in ms after which pose estimation will be triggered
++    // Two operation modes:
++    // 1) Legacy mode (enable_service_trigger:=false): periodically switch to pose estimation.
++    // 2) One-shot mode (enable_service_trigger:=true): wait for a Trigger service call and run
++    //    a single pose-estimation -> tracking cycle, then return to idle.
++    const bool enable_service_trigger = this->declare_parameter<bool>(
++      "enable_service_trigger", false);
++    trigger_service_name_ = this->declare_parameter<std::string>(
++      "trigger_service_name", "/foundationpose/trigger_pose_estimation");
++
++    // reset period in ms after which pose estimation will be triggered (legacy mode)
+     this->declare_parameter<int>("reset_period", 20000);
+     this->get_parameter("reset_period", reset_period_);
+ 
+-    timer_ = this->create_wall_timer(
+-      std::chrono::milliseconds(reset_period_),
+-      std::bind(&Selector::timerCallback, this));
++    if (enable_service_trigger) {
++      state_ = State::kIdle;
++      trigger_service_ = this->create_service<std_srvs::srv::Trigger>(
++        trigger_service_name_,
++        std::bind(
++          &Selector::triggerCallback, this, std::placeholders::_1, std::placeholders::_2));
++    } else {
++      timer_ = this->create_wall_timer(
++        std::chrono::milliseconds(reset_period_),
++        std::bind(&Selector::timerCallback, this));
++    }
++  }
++
++  void triggerCallback(
++    const std::shared_ptr<std_srvs::srv::Trigger::Request> /*request*/,
++    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
++  {
++    std::unique_lock<std::mutex> lock(mutex_);
++    if (state_ != State::kIdle) {
++      response->success = false;
++      response->message = "FoundationPose busy (not idle).";
++      return;
++    }
++    state_ = State::kPoseEstimation;
++    response->success = true;
++    response->message = "Triggered FoundationPose one-shot cycle.";
+   }
+ 
+   void selectionCallback(
+@@ -131,12 +164,17 @@ public:
+       pose_estimation_depth_pub_->publish(*depth_msg);
+       pose_estimation_segmenation_pub_->publish(*segmentaion_msg);
+       state_ = State::kWaitingReset;
++    } else if (state_ == State::kIdle) {
++      // Idle: drop synced inputs to save resources.
++      return;
+     } else if (state_ == State::kTracking) {
+       // Publish all messages except segmentation to tracking
+       tracking_image_pub_->publish(*image_msg);
+       tracking_camera_pub_->publish(*camera_info_msg);
+       tracking_depth_pub_->publish(*depth_msg);
+       tracking_pose_pub_->publish(*tracking_pose_msg_);
++      // One-shot mode: after the first tracking frame, return to idle.
++      state_ = State::kIdle;
+     }
+   }
+ 
+@@ -200,6 +238,7 @@ private:
+ 
+   enum State
+   {
++    kIdle,
+     kTracking,
+     kPoseEstimation,
+     kWaitingReset
+@@ -207,6 +246,9 @@ private:
+   // State
+   State state_ = State::kPoseEstimation;
+ 
++  std::string trigger_service_name_;
++  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_service_;
++
+   // Exact message sync policy
+   using ExactPolicy = message_filters::sync_policies::ExactTime<
+     nvidia::isaac_ros::nitros::NitrosImage,
+diff --git a/isaac_ros_foundationpose/src/foundationpose_tracking_node.cpp b/isaac_ros_foundationpose/src/foundationpose_tracking_node.cpp
+index 7e1d4d0..d470872 100644
+--- a/isaac_ros_foundationpose/src/foundationpose_tracking_node.cpp
++++ b/isaac_ros_foundationpose/src/foundationpose_tracking_node.cpp
+@@ -23,6 +23,14 @@
+ #include "rclcpp/rclcpp.hpp"
+ #include "tf2_ros/transform_broadcaster.h"
+ 
++#include <iomanip>
++#include <algorithm>
++#include <sstream>
++#include <cctype>
++#include <std_msgs/msg/string.hpp>
++#include <tf2/LinearMath/Matrix3x3.h>
++#include <tf2/LinearMath/Quaternion.h>
++
+ #include "isaac_ros_nitros_camera_info_type/nitros_camera_info.hpp"
+ #include "isaac_ros_nitros_detection3_d_array_type/nitros_detection3_d_array.hpp"
+ #include "isaac_ros_nitros_image_type/nitros_image.hpp"
+@@ -72,6 +80,7 @@ const std::vector<std::pair<std::string, std::string>> EXTENSIONS = {
+   {"isaac_ros_gxf", "gxf/lib/multimedia/libgxf_multimedia.so"},
+   {"isaac_ros_gxf", "gxf/lib/serialization/libgxf_serialization.so"},
+   {"isaac_ros_gxf", "gxf/lib/cuda/libgxf_cuda.so"},
++  {"gxf_isaac_message_compositor", "gxf/lib/libgxf_isaac_message_compositor.so"},
+   {"gxf_isaac_depth_image_proc", "gxf/lib/libgxf_isaac_depth_image_proc.so"},
+   {"gxf_isaac_sgm", "gxf/lib/libgxf_isaac_sgm.so"},
+   {"gxf_isaac_messages", "gxf/lib/libgxf_isaac_messages.so"},
+@@ -159,10 +168,27 @@ FoundationPoseTrackingNode::FoundationPoseTrackingNode(rclcpp::NodeOptions optio
+   refine_output_binding_names_(
+     declare_parameter<StringList>("refine_output_binding_names", StringList())),
+ 
+-  tf_frame_name_(declare_parameter<std::string>("tf_frame_name", "fp_object"))
++  tf_frame_name_(declare_parameter<std::string>("tf_frame_name", "fp_object")),
++  xyzrpy_topic_(declare_parameter<std::string>("xyzrpy_topic", "/pose_estimation/xyzrpy")),
++  xyzrpy_precision_(declare_parameter<int>("xyzrpy_precision", 6))
+ {
+   RCLCPP_DEBUG(get_logger(), "[FoundationPoseTrackingNode] Constructor");
+ 
++  xyzrpy_pub_ = this->create_publisher<std_msgs::msg::String>(xyzrpy_topic_, 10);
++
++  // Subscribe to YOLO model id so we can switch mesh/texture before we run inference.
++  model_id_topic_ = this->declare_parameter<std::string>("model_id_topic", "/yolo_model_id");
++  k2_mesh_file_path_ = this->declare_parameter<std::string>("k2_mesh_file_path", "");
++  k2_texture_path_ = this->declare_parameter<std::string>("k2_texture_path", "");
++  j2_mesh_file_path_ = this->declare_parameter<std::string>("j2_mesh_file_path", "");
++  j2_texture_path_ = this->declare_parameter<std::string>("j2_texture_path", "");
++  other_mesh_file_path_ = this->declare_parameter<std::string>("other_mesh_file_path", "");
++  other_texture_path_ = this->declare_parameter<std::string>("other_texture_path", "");
++
++  model_id_sub_ = this->create_subscription<std_msgs::msg::String>(
++    model_id_topic_, rclcpp::QoS(10),
++    std::bind(&FoundationPoseTrackingNode::modelIdCallback, this, std::placeholders::_1));
++
+   // Add callback function for Fundation Pose Detection3D array to broadcast to ros tf tree
+   config_map_[OUTPUT_POSE_COMPONENT_KEY].callback = std::bind(
+     &FoundationPoseTrackingNode::FoundationPoseTrackingCallback, this,
+@@ -295,6 +321,94 @@ void FoundationPoseTrackingNode::postLoadGraphCallback()
+ 
+   getNitrosContext().setParameterFloat32(
+     "render", "nvidia::isaac_ros::FoundationposeRender", "max_depth", max_depth_);
++
++  // Mark graph as ready and apply any model switch requested before this point.
++  std::string pending_mesh;
++  std::string pending_texture;
++  {
++    std::lock_guard<std::mutex> lock(model_update_mutex_);
++    graph_ready_ = true;
++    pending_mesh = pending_mesh_file_path_;
++    pending_texture = pending_texture_path_;
++    pending_mesh_file_path_.clear();
++    pending_texture_path_.clear();
++  }
++  if (!pending_mesh.empty() && !pending_texture.empty()) {
++    applyModelPaths(pending_mesh, pending_texture);
++  }
++}
++
++void FoundationPoseTrackingNode::modelIdCallback(
++  const std_msgs::msg::String::ConstSharedPtr msg)
++{
++  if (!msg) {
++    return;
++  }
++
++  std::string model_id = msg->data;
++  // normalize
++  model_id.erase(0, model_id.find_first_not_of(" \t\n\r"));
++  model_id.erase(model_id.find_last_not_of(" \t\n\r") + 1);
++  std::transform(model_id.begin(), model_id.end(), model_id.begin(),
++                 [](unsigned char c) { return std::tolower(c); });
++
++  std::string mesh;
++  std::string texture;
++  {
++    std::lock_guard<std::mutex> lock(model_update_mutex_);
++    if (model_id == "k2" && !k2_mesh_file_path_.empty() && !k2_texture_path_.empty()) {
++      mesh = k2_mesh_file_path_;
++      texture = k2_texture_path_;
++    } else if (model_id == "j2" && !j2_mesh_file_path_.empty() && !j2_texture_path_.empty()) {
++      mesh = j2_mesh_file_path_;
++      texture = j2_texture_path_;
++    } else if (!other_mesh_file_path_.empty() && !other_texture_path_.empty()) {
++      mesh = other_mesh_file_path_;
++      texture = other_texture_path_;
++    } else {
++      // fallback: keep current mesh/texture
++      mesh = mesh_file_path_;
++      texture = texture_path_;
++    }
++
++    if (!graph_ready_) {
++      if (pending_mesh_file_path_ != mesh || pending_texture_path_ != texture) {
++        pending_mesh_file_path_ = mesh;
++        pending_texture_path_ = texture;
++      }
++      return;
++    }
++  }
++
++  // Apply outside the lock: applyModelPaths will call into GXF context.
++  applyModelPaths(mesh, texture);
++}
++
++void FoundationPoseTrackingNode::applyModelPaths(
++  const std::string & new_mesh_file_path, const std::string & new_texture_path)
++{
++  if (new_mesh_file_path.empty() || new_texture_path.empty()) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> lock(model_update_mutex_);
++  if (new_mesh_file_path == mesh_file_path_ && new_texture_path == texture_path_) {
++    return;
++  }
++  mesh_file_path_ = new_mesh_file_path;
++  texture_path_ = new_texture_path;
++
++  // Update mesh/texture paths for render/transform/decoder blocks.
++  getNitrosContext().setParameterStr(
++    "render", "nvidia::isaac_ros::FoundationposeRender", "mesh_file_path", mesh_file_path_);
++  getNitrosContext().setParameterStr(
++    "render", "nvidia::isaac_ros::FoundationposeRender", "texture_path", texture_path_);
++
++  getNitrosContext().setParameterStr(
++    "transform", "nvidia::isaac_ros::FoundationposeTransformation", "mesh_file_path",
++    mesh_file_path_);
++  getNitrosContext().setParameterStr(
++    "decoder", "nvidia::isaac_ros::FoundationposeDecoder", "mesh_file_path", mesh_file_path_);
+ }
+ 
+ void FoundationPoseTrackingNode::FoundationPoseTrackingCallback(
+@@ -351,6 +465,29 @@ void FoundationPoseTrackingNode::FoundationPoseTrackingCallback(
+     transform_stamped.transform.rotation.w = pose->rotation.quaternion().w();
+ 
+     tf_broadcaster_->sendTransform(transform_stamped);
++
++    // Publish xyzrpy as comma-separated string for external consumers (e.g., FSM/UI).
++    tf2::Quaternion q(
++      transform_stamped.transform.rotation.x,
++      transform_stamped.transform.rotation.y,
++      transform_stamped.transform.rotation.z,
++      transform_stamped.transform.rotation.w);
++    tf2::Matrix3x3 m(q);
++    double roll = 0.0;
++    double pitch = 0.0;
++    double yaw = 0.0;
++    m.getRPY(roll, pitch, yaw);
++
++    std::ostringstream oss;
++    oss << std::fixed << std::setprecision(xyzrpy_precision_)
++        << transform_stamped.transform.translation.x << ','
++        << transform_stamped.transform.translation.y << ','
++        << transform_stamped.transform.translation.z << ','
++        << roll << ',' << pitch << ',' << yaw;
++
++    std_msgs::msg::String xyzrpy_msg;
++    xyzrpy_msg.data = oss.str();
++    xyzrpy_pub_->publish(xyzrpy_msg);
+   }
+ }
+ 

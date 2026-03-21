@@ -1,0 +1,50 @@
+diff --git a/isaac_ros_nitros/CMakeLists.txt b/isaac_ros_nitros/CMakeLists.txt
+index 56caf75..63b8cea 100644
+--- a/isaac_ros_nitros/CMakeLists.txt
++++ b/isaac_ros_nitros/CMakeLists.txt
+@@ -67,7 +67,8 @@ install(FILES lib/cuapriltags/cuapriltags/cuAprilTags.h
+ # cuApriltags (register path)
+ ament_index_register_resource(cuapriltags CONTENT share/${PROJECT_NAME}/cuapriltags)
+ 
+-# Dependencies
++# Dependencies (magic_enum required by isaac_ros_gxf Core target)
++find_package(magic_enum REQUIRED)
+ find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+ find_package(vpi REQUIRED)
+ find_package(yaml-cpp)
+diff --git a/isaac_ros_nitros/package.xml b/isaac_ros_nitros/package.xml
+index d3ee1d3..969f072 100644
+--- a/isaac_ros_nitros/package.xml
++++ b/isaac_ros_nitros/package.xml
+@@ -30,6 +30,7 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
+   <depend>std_msgs</depend>
+   <depend>isaac_ros_nitros_interfaces</depend>
+   <depend>isaac_ros_gxf</depend>
++  <depend>magic_enum</depend>
+   <depend>gxf_isaac_optimizer</depend>
+   <depend>gxf_isaac_message_compositor</depend>
+ 
+diff --git a/isaac_ros_nitros_type/isaac_ros_nitros_detection3_d_array_type/CMakeLists.txt b/isaac_ros_nitros_type/isaac_ros_nitros_detection3_d_array_type/CMakeLists.txt
+index 2ffc2ba..027f5c2 100644
+--- a/isaac_ros_nitros_type/isaac_ros_nitros_detection3_d_array_type/CMakeLists.txt
++++ b/isaac_ros_nitros_type/isaac_ros_nitros_detection3_d_array_type/CMakeLists.txt
+@@ -34,6 +34,7 @@ if(USE_NVTX)
+ endif()
+ 
+ # Dependencies
++find_package(vision_msgs REQUIRED)
+ find_package(yaml-cpp)
+ find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+ 
+@@ -42,7 +43,10 @@ ament_auto_add_library(${PROJECT_NAME} SHARED
+   src/nitros_detection3_d_array.cpp
+   src/detection3_d_array_message.cpp
+ )
+-target_include_directories(${PROJECT_NAME} PUBLIC include/detection3_d_array_message)
++target_include_directories(${PROJECT_NAME} PUBLIC
++  include/detection3_d_array_message
++  ${vision_msgs_INCLUDE_DIRS}
++)
+ target_link_libraries(${PROJECT_NAME}
+   Eigen3::Eigen
+   yaml-cpp
