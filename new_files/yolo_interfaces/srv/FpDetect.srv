@@ -7,3 +7,5 @@ bool success
 string message
 # 位姿（相机光学帧下，单位：米 / 四元数）
 geometry_msgs/PoseStamped pose
+# 成功时：各阶段计时的 JSON（yolo_ms, fp_load_ms, fp_infer_ms, total_ms 等）；失败时为空
+string timing_json

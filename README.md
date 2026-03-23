@@ -171,7 +171,14 @@ future = cli.call_async(req)
 # ... await future ...
 if future.result().success:
     pose = future.result().pose   # geometry_msgs/PoseStamped
+    # 各阶段耗时 JSON（yolo_ms, fp_load_ms, fp_infer_ms, total_ms ...）
+    import json
+    timing = json.loads(future.result().timing_json or '{}')
 ```
+
+**Batch timing test (default 10 runs):** after `colcon build` + sourcing workspaces, run  
+`ros2 run isaac_ros_foundationpose fp_pipeline_test.py k2c`  
+Outputs per-run `run_XX_timing.txt`, `runs.jsonl`, and `average_timing.json` / `average_timing.txt` under `fp_timing_logs/batch_*_k2c/`.
 
 ---
 

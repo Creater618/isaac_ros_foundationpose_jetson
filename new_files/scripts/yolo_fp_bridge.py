@@ -240,6 +240,7 @@ class YoloFpBridgeNode(Node):
 
     def _do_detect(self, cls: str,
                    response: FpDetect.Response) -> FpDetect.Response:
+        response.timing_json = ''
         timing = {'class': cls,
                   'timestamp': datetime.datetime.now().isoformat(),
                   'fp_model_loaded_before': False}
@@ -416,6 +417,8 @@ class YoloFpBridgeNode(Node):
         response.success = True
         response.message = f'OK  class={cls}'
         response.pose = self._latest_pose
+        # 供测试脚本汇总平均耗时（与 fp_timing.jsonl 同结构）
+        response.timing_json = json.dumps(timing, ensure_ascii=False)
         return response
 
     # ------------------------------------------------------------------
