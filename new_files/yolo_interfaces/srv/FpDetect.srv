@@ -1,0 +1,9 @@
+# 请求 FoundationPose 对指定类别进行一次 6D 位姿估计
+# class_name: "k2c" 或 "j2"（后续扩展）
+string class_name
+---
+# 响应：6D 位姿结果
+bool success
+string message
+# 位姿（相机光学帧下，单位：米 / 四元数）
+geometry_msgs/PoseStamped pose

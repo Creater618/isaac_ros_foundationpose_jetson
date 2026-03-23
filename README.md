@@ -12,6 +12,16 @@ This repository contains **patches and new files** to apply on top of the offici
 
 ```
 .
+├── new_files/
+│   ├── launch/
+│   │   └── yolo_fp_bridge.launch.py       # Launch file for YOLO→FP bridge (service mode)
+│   ├── scripts/
+│   │   ├── yolo_fp_bridge.py              # Bridge node: /foundationpose/detect service
+│   │   └── fp_pose_monitor.py             # Real-time 6D pose monitor
+│   └── yolo_interfaces/                   # Updated yolo_interfaces with FpDetect.srv
+│       ├── CMakeLists.txt
+│       ├── package.xml
+│       └── srv/FpDetect.srv
 ├── patches/
 │   ├── 01_isaac_ros_common.patch          # FindTENSORRT.cmake → TRT 10.3
 │   ├── 02_isaac_ros_dnn_inference.patch   # TRT 8.x → 10.x API full migration
@@ -122,21 +132,45 @@ ros2 launch isaac_ros_foundationpose yolo_fp_bridge.launch.py \
 ros2 run isaac_ros_foundationpose fp_pose_monitor.py
 ```
 
-**Motion control subscription:**
+**Motion control / FSM integration (Service mode):**
 
-The 6D pose is published on `/foundationpose/pose` as `geometry_msgs/PoseStamped`:
+The bridge exposes `/foundationpose/detect` — call once, get pose once, no continuous polling:
+
+```bash
+# FSM calls this when it needs K2 pose:
+ros2 service call /foundationpose/detect yolo_interfaces/srv/FpDetect \
+  "{class_name: 'k2c'}"
+
+# Response:
+# success: true/false
+# message: "OK  class=k2c" or error description
+# pose: geometry_msgs/PoseStamped (position in meters, quaternion orientation)
+```
+
+**Topic output** (optional subscription):
+
+The 6D pose is also published on `geometry_msgs/PoseStamped` topics:
+| Topic | Description |
+|-------|-------------|
+| `/foundationpose/k2c/pose` | K2 twist-lock pose (each successful detection) |
+| `/foundationpose/j2/pose`  | J2 pose (reserved for future use) |
+| `/foundationpose/pose`     | Latest pose (any class) |
+
 - `frame_id`: camera optical frame (e.g. `right_camera_color_optical_frame`)
 - `pose.position`: object center in camera frame (meters)
 - `pose.orientation`: object orientation as quaternion (x, y, z, w)
-- Source: `/tracking/output` (real-time tracking), fallback to `/pose_estimation/output`
 
-```bash
-# Quick check from motion control side:
-ros2 topic echo /foundationpose/pose
+```python
+# FSM Python client example:
+from yolo_interfaces.srv import FpDetect
 
-# Or subscribe in Python:
-from geometry_msgs.msg import PoseStamped
-self.create_subscription(PoseStamped, '/foundationpose/pose', callback, 10)
+cli = self.create_client(FpDetect, '/foundationpose/detect')
+req = FpDetect.Request()
+req.class_name = 'k2c'
+future = cli.call_async(req)
+# ... await future ...
+if future.result().success:
+    pose = future.result().pose   # geometry_msgs/PoseStamped
 ```
 
 ---
