@@ -28,6 +28,7 @@ FSM 流程：
 """
 
 import copy
+import json
 import os
 import sys
 import time
@@ -35,6 +36,7 @@ import math
 import signal
 import subprocess
 import threading
+import datetime
 
 import numpy as np
 import cv2
@@ -83,6 +85,8 @@ class YoloFpBridgeNode(Node):
         self.declare_parameter('fp_wait_timeout', 90.0)
         # 等待 FP 输出位姿的超时（秒）
         self.declare_parameter('pose_timeout', 10.0)
+        # 计时日志保存目录（空则不保存）
+        self.declare_parameter('timing_log_dir', '/media/rykj/nvme/jetson/fp_timing_logs')
 
         self.mesh_dir = self.get_parameter('mesh_dir').value
         raw_map = self.get_parameter('class_to_mesh').value
@@ -102,6 +106,9 @@ class YoloFpBridgeNode(Node):
         self.default_texture = self.get_parameter('default_texture').value
         self.fp_wait_timeout = self.get_parameter('fp_wait_timeout').value
         self.pose_timeout   = self.get_parameter('pose_timeout').value
+        self.timing_log_dir = self.get_parameter('timing_log_dir').value
+        if self.timing_log_dir:
+            os.makedirs(self.timing_log_dir, exist_ok=True)
 
         self.bridge = CvBridge()
 
@@ -233,6 +240,11 @@ class YoloFpBridgeNode(Node):
 
     def _do_detect(self, cls: str,
                    response: FpDetect.Response) -> FpDetect.Response:
+        timing = {'class': cls,
+                  'timestamp': datetime.datetime.now().isoformat(),
+                  'fp_model_loaded_before': False}
+        t0 = time.monotonic()
+
         # ── 1. 检查相机内参 ───────────────────────────────────
         if self.camera_info is None:
             response.success = False
@@ -247,11 +259,20 @@ class YoloFpBridgeNode(Node):
             self.get_logger().error(response.message)
             return response
 
+        t_yolo_start = time.monotonic()
         req = YoloDetect.Request()
         req.class_name = cls
+        _yolo_event = threading.Event()
+        _yolo_result = [None]
+        def _yolo_cb(f):
+            _yolo_result[0] = f.result()
+            _yolo_event.set()
         future = self.yolo_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=8.0)
-        yolo_resp = future.result()
+        future.add_done_callback(_yolo_cb)
+        _yolo_event.wait(timeout=8.0)
+        yolo_resp = _yolo_result[0]
+        t_yolo_end = time.monotonic()
+        timing['yolo_ms'] = round((t_yolo_end - t_yolo_start) * 1000, 1)
 
         if yolo_resp is None or not yolo_resp.success or not yolo_resp.detections:
             msg = f'YOLO 未检测到 [{cls}]'
@@ -262,13 +283,15 @@ class YoloFpBridgeNode(Node):
             self.get_logger().info(msg)
             return response
 
-        # 取置信度最高的检测结果
         best = max(yolo_resp.detections, key=lambda d: d.confidence)
+        timing['yolo_confidence'] = round(float(best.confidence), 4)
+        timing['yolo_center_3d'] = [round(float(v), 4) for v in best.center_point]
         self.get_logger().info(
-            f'YOLO 检测到 [{cls}] conf={best.confidence:.3f}  '
+            f'YOLO [{cls}] conf={best.confidence:.3f}  '
             f'3D=({best.center_point[0]:.3f},'
             f'{best.center_point[1]:.3f},'
-            f'{best.center_point[2]:.3f})m'
+            f'{best.center_point[2]:.3f})m  '
+            f'耗时={timing["yolo_ms"]:.0f}ms'
         )
 
         # ── 3. 查找对应 .obj 文件 ─────────────────────────────
@@ -279,13 +302,18 @@ class YoloFpBridgeNode(Node):
             response.message = f'未在 {self.mesh_dir} 找到 {mesh_name}.obj'
             self.get_logger().error(response.message)
             return response
+        timing['mesh_file'] = obj_path
 
         # ── 4. 如果类别切换或 FP 崩溃，重启 FP ──────────────
         fp_crashed = (self.fp_process is not None and
                       self.fp_process.poll() is not None)
-        if cls != self.current_class or fp_crashed:
+        fp_needs_launch = (cls != self.current_class or fp_crashed)
+        timing['fp_model_loaded_before'] = not fp_needs_launch
+
+        if fp_needs_launch:
             reason = '类别切换' if cls != self.current_class else 'FP 进程异常'
             self.get_logger().info(f'{reason}，重启 FoundationPose → {obj_path}')
+            t_fp_launch = time.monotonic()
             self._launch_fp(obj_path)
             self._latest_class = cls
             self.current_class = cls
@@ -297,11 +325,17 @@ class YoloFpBridgeNode(Node):
                 response.message = 'FoundationPose 启动超时'
                 self.get_logger().error(response.message)
                 return response
-            self.get_logger().info('FoundationPose 已就绪')
+            t_fp_ready = time.monotonic()
+            timing['fp_load_ms'] = round((t_fp_ready - t_fp_launch) * 1000, 1)
+            self.get_logger().info(
+                f'FoundationPose 已就绪  模型加载={timing["fp_load_ms"]:.0f}ms'
+            )
         else:
+            timing['fp_load_ms'] = 0.0
             self._latest_class = cls
 
         # ── 5. 图像转换 ───────────────────────────────────────
+        t_img_start = time.monotonic()
         try:
             rgb_out   = self._to_rgb8(yolo_resp.rgb, self.bridge)
             depth_out = self._to_32fc1(yolo_resp.depth, self.bridge)
@@ -312,41 +346,51 @@ class YoloFpBridgeNode(Node):
             self.get_logger().error(response.message)
             return response
 
-        # 统一时间戳（ExactSync 要求）
         stamp = yolo_resp.rgb.header.stamp
         for m in (rgb_out, depth_out, mask_msg):
             m.header.stamp = stamp
         cam_info = copy.deepcopy(self.camera_info)
         cam_info.header.stamp = stamp
+        timing['img_convert_ms'] = round((time.monotonic() - t_img_start) * 1000, 1)
 
-        # ── 6. 清空上次位姿结果，发布图像 ─────────────────────
+        # ── 6. 清空位姿事件，发布图像 ─────────────────────────
         self._pose_event.clear()
         self._latest_pose = None
 
+        t_pub = time.monotonic()
         self.img_pub.publish(rgb_out)
         self.depth_pub.publish(depth_out)
         self.seg_pub.publish(mask_msg)
         self.cam_pub.publish(cam_info)
+        timing['img_pub_ms'] = round((time.monotonic() - t_pub) * 1000, 1)
         self.get_logger().info(
-            f'已发布图像: RGB {rgb_out.width}×{rgb_out.height}  '
-            f'Depth {depth_out.width}×{depth_out.height}  '
-            f'Mask {mask_msg.width}×{mask_msg.height}'
+            f'已发布图像 RGB {rgb_out.width}×{rgb_out.height}  '
+            f'发布耗时={timing["img_pub_ms"]:.0f}ms'
         )
 
         # ── 7. 触发 FP selector ───────────────────────────────
+        t_trigger = time.monotonic()
         if self.trigger_cli.service_is_ready():
+            _trig_event = threading.Event()
+            _trig_result = [None]
+            def _trig_cb(f):
+                _trig_result[0] = f.result()
+                _trig_event.set()
             trig_fut = self.trigger_cli.call_async(Trigger.Request())
-            rclpy.spin_until_future_complete(self, trig_fut, timeout_sec=3.0)
-            trig_res = trig_fut.result()
+            trig_fut.add_done_callback(_trig_cb)
+            _trig_event.wait(timeout=3.0)
+            trig_res = _trig_result[0]
             if trig_res and trig_res.success:
                 self.get_logger().info('已触发位姿估计')
             else:
                 msg_str = trig_res.message if trig_res else '超时'
                 self.get_logger().warn(f'触发返回: {msg_str}（继续等待）')
         else:
-            self.get_logger().warn('trigger 服务未就绪，跳过触发，直接等待输出')
+            self.get_logger().warn('trigger 服务未就绪，直接等待输出')
+        timing['trigger_ms'] = round((time.monotonic() - t_trigger) * 1000, 1)
 
         # ── 8. 等待 FP 输出位姿 ───────────────────────────────
+        t_wait = time.monotonic()
         if not self._pose_event.wait(timeout=self.pose_timeout):
             response.success = False
             response.message = (
@@ -354,19 +398,72 @@ class YoloFpBridgeNode(Node):
             )
             self.get_logger().warn(response.message)
             return response
+        timing['fp_infer_ms'] = round((time.monotonic() - t_wait) * 1000, 1)
 
-        # ── 9. 返回结果 ───────────────────────────────────────
+        # ── 9. 汇总计时 ───────────────────────────────────────
+        timing['total_ms'] = round((time.monotonic() - t0) * 1000, 1)
+
+        p = self._latest_pose.pose.position
+        r = self._latest_pose.pose.orientation
+        timing['pose'] = {
+            'x': round(p.x, 6), 'y': round(p.y, 6), 'z': round(p.z, 6),
+            'qx': round(r.x, 6), 'qy': round(r.y, 6),
+            'qz': round(r.z, 6), 'qw': round(r.w, 6),
+        }
+
+        self._print_and_save_timing(timing)
+
         response.success = True
         response.message = f'OK  class={cls}'
         response.pose = self._latest_pose
-        p = response.pose.pose.position
-        r = response.pose.pose.orientation
-        self.get_logger().info(
-            f'[detect/{cls}] 成功  '
-            f'xyz=({p.x:.4f},{p.y:.4f},{p.z:.4f})  '
-            f'q=({r.x:.4f},{r.y:.4f},{r.z:.4f},{r.w:.4f})'
-        )
         return response
+
+    # ------------------------------------------------------------------
+    # 计时结果打印 + 保存
+    # ------------------------------------------------------------------
+    def _print_and_save_timing(self, t: dict):
+        sep = '─' * 60
+        loaded_str = '（已加载，跳过）' if t['fp_model_loaded_before'] else ''
+        lines = [
+            '',
+            sep,
+            f'  6D 位姿估计计时报告  [{t["class"]}]  {t["timestamp"]}',
+            sep,
+            f'  ① YOLO 检测耗时          : {t["yolo_ms"]:>8.1f} ms',
+            f'     置信度={t["yolo_confidence"]:.4f}  '
+            f'中心3D={t["yolo_center_3d"]}m',
+            f'  ② FP 模型加载耗时         : {t["fp_load_ms"]:>8.1f} ms  {loaded_str}',
+            f'     mesh: {t["mesh_file"]}',
+            f'  ③ 图像转换耗时            : {t["img_convert_ms"]:>8.1f} ms',
+            f'  ④ 图像发布耗时            : {t["img_pub_ms"]:>8.1f} ms',
+            f'  ⑤ FP 触发耗时             : {t["trigger_ms"]:>8.1f} ms',
+            f'  ⑥ FP 推理/位姿计算耗时    : {t["fp_infer_ms"]:>8.1f} ms',
+            sep,
+            f'  总耗时（不含模型加载）    : '
+            f'{t["total_ms"] - t["fp_load_ms"]:>8.1f} ms',
+            f'  总耗时（含模型加载）      : {t["total_ms"]:>8.1f} ms',
+            sep,
+            f'  位姿结果:',
+            f'    位置 x={t["pose"]["x"]:+.6f}  y={t["pose"]["y"]:+.6f}'
+            f'  z={t["pose"]["z"]:+.6f}  (m)',
+            f'    四元数 qx={t["pose"]["qx"]:+.6f}  qy={t["pose"]["qy"]:+.6f}'
+            f'  qz={t["pose"]["qz"]:+.6f}  qw={t["pose"]["qw"]:+.6f}',
+            sep,
+        ]
+        report = '\n'.join(lines)
+        self.get_logger().info(report)
+
+        if not self.timing_log_dir:
+            return
+        # 保存 JSONL（每次追加一行）
+        jsonl_path = os.path.join(self.timing_log_dir, 'fp_timing.jsonl')
+        with open(jsonl_path, 'a') as f:
+            f.write(json.dumps(t, ensure_ascii=False) + '\n')
+        # 保存可读文本（每次追加）
+        txt_path = os.path.join(self.timing_log_dir, 'fp_timing.txt')
+        with open(txt_path, 'a') as f:
+            f.write(report + '\n')
+        self.get_logger().info(f'计时日志已保存: {jsonl_path}')
 
     # ------------------------------------------------------------------
     # 查找 obj 文件
