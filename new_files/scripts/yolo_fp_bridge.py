@@ -52,6 +52,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 
+from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image, CameraInfo
 from std_srvs.srv import Trigger
 from vision_msgs.msg import Detection3DArray
@@ -87,6 +88,10 @@ class YoloFpBridgeNode(Node):
         self.declare_parameter('score_model', '/tmp/score_model.onnx')
         self.declare_parameter('default_texture', '/tmp/k2c_texture.png')
         self.declare_parameter('fp_wait_timeout', 60.0)
+        # 运控订阅的位姿话题（以 tracking 输出为主，fallback 到 pose_estimation）
+        self.declare_parameter('pose_topic', '/foundationpose/pose')
+        # 发布位姿时使用的 frame_id（为空则用相机 frame）
+        self.declare_parameter('pose_frame_id', '')
 
         self.mesh_dir = self.get_parameter('mesh_dir').value
 
@@ -116,6 +121,8 @@ class YoloFpBridgeNode(Node):
         self.score_model = self.get_parameter('score_model').value
         self.default_texture = self.get_parameter('default_texture').value
         self.fp_wait_timeout = self.get_parameter('fp_wait_timeout').value
+        pose_topic = self.get_parameter('pose_topic').value
+        self._pose_frame_id_override = self.get_parameter('pose_frame_id').value
 
         self.bridge = CvBridge()
 
@@ -124,12 +131,17 @@ class YoloFpBridgeNode(Node):
         self.current_class: str | None = None
         self.fp_process: subprocess.Popen | None = None
         self._fp_lock = threading.Lock()
+        self._last_tracking_time: float = 0.0   # 最后一次 tracking 输出时间
 
         # ── 发布到 selector 输入话题 ───────────────────────────
         self.img_pub = self.create_publisher(Image, '/image', 10)
         self.depth_pub = self.create_publisher(Image, '/depth_image', 10)
         self.seg_pub = self.create_publisher(Image, '/segmentation', 10)
         self.cam_pub = self.create_publisher(CameraInfo, '/camera_info', 10)
+
+        # ── 运控订阅的 6D 位姿话题 ────────────────────────────
+        self.pose_pub = self.create_publisher(PoseStamped, pose_topic, 10)
+        self.get_logger().info(f'6D 位姿将发布至: {pose_topic}')
 
         # ── 订阅相机内参（缓存一次即可）──────────────────────────
         self.create_subscription(CameraInfo, camera_info_topic,
@@ -168,25 +180,69 @@ class YoloFpBridgeNode(Node):
             )
 
     # ------------------------------------------------------------------
-    # FP 位姿输出回调（打印结果）
+    # FP 位姿输出回调
     # ------------------------------------------------------------------
+    def _build_pose_stamped(self, msg: Detection3DArray) -> PoseStamped | None:
+        """从 Detection3DArray 中取置信度最高的 Detection 构建 PoseStamped。"""
+        if not msg.detections:
+            return None
+
+        # 取 results 中 score 最高的假设；若无 results 则直接用 bbox.center
+        best_det = None
+        best_score = -1.0
+        for det in msg.detections:
+            if det.results:
+                score = max(r.hypothesis.score for r in det.results)
+            else:
+                score = 1.0  # 无 score 信息时默认选第一个
+            if score > best_score:
+                best_score = score
+                best_det = det
+
+        if best_det is None:
+            return None
+
+        pose_msg = PoseStamped()
+        pose_msg.header = msg.header
+        if self._pose_frame_id_override:
+            pose_msg.header.frame_id = self._pose_frame_id_override
+        elif self.camera_info and self.camera_info.header.frame_id:
+            pose_msg.header.frame_id = self.camera_info.header.frame_id
+
+        pose_msg.pose = best_det.bbox.center
+        return pose_msg
+
     def _pose_est_cb(self, msg: Detection3DArray):
+        """初始位姿估计回调：打印 + 在没有近期 tracking 时发布。"""
         for det in msg.detections:
             p = det.bbox.center.position
             r = det.bbox.center.orientation
             self.get_logger().info(
-                f'[PoseEstimation] xyz=({p.x:.3f},{p.y:.3f},{p.z:.3f})  '
-                f'qxyzw=({r.x:.3f},{r.y:.3f},{r.z:.3f},{r.w:.3f})'
+                f'[PoseEstimation] xyz=({p.x:.4f},{p.y:.4f},{p.z:.4f})  '
+                f'q=({r.x:.4f},{r.y:.4f},{r.z:.4f},{r.w:.4f})'
             )
 
+        # 若 tracking 超过 2 秒未输出，用 pose_estimation 的结果兜底
+        now = time.monotonic()
+        if now - self._last_tracking_time > 2.0:
+            ps = self._build_pose_stamped(msg)
+            if ps is not None:
+                self.pose_pub.publish(ps)
+
     def _tracking_cb(self, msg: Detection3DArray):
+        """跟踪位姿回调：打印 + 实时发布给运控。"""
         for det in msg.detections:
             p = det.bbox.center.position
             r = det.bbox.center.orientation
             self.get_logger().info(
-                f'[Tracking]       xyz=({p.x:.3f},{p.y:.3f},{p.z:.3f})  '
-                f'qxyzw=({r.x:.3f},{r.y:.3f},{r.z:.3f},{r.w:.3f})'
+                f'[Tracking]       xyz=({p.x:.4f},{p.y:.4f},{p.z:.4f})  '
+                f'q=({r.x:.4f},{r.y:.4f},{r.z:.4f},{r.w:.4f})'
             )
+
+        ps = self._build_pose_stamped(msg)
+        if ps is not None:
+            self._last_tracking_time = time.monotonic()
+            self.pose_pub.publish(ps)
 
     # ------------------------------------------------------------------
     # 查找 obj 文件（支持 class_to_mesh 映射）

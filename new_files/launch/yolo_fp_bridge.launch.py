@@ -86,6 +86,14 @@ def generate_launch_description():
         'fp_wait_timeout', default_value='60.0',
         description='Seconds to wait for FoundationPose to become ready after launch',
     )
+    pose_topic_arg = DeclareLaunchArgument(
+        'pose_topic', default_value='/foundationpose/pose',
+        description='PoseStamped topic published for motion control',
+    )
+    pose_frame_id_arg = DeclareLaunchArgument(
+        'pose_frame_id', default_value='',
+        description='Override frame_id in PoseStamped (empty = use camera frame)',
+    )
 
     bridge_node = Node(
         package='isaac_ros_foundationpose',
@@ -104,6 +112,8 @@ def generate_launch_description():
             'score_model': LaunchConfiguration('score_model'),
             'default_texture': LaunchConfiguration('default_texture'),
             'fp_wait_timeout': LaunchConfiguration('fp_wait_timeout'),
+            'pose_topic': LaunchConfiguration('pose_topic'),
+            'pose_frame_id': LaunchConfiguration('pose_frame_id'),
         }],
     )
 
@@ -119,5 +129,7 @@ def generate_launch_description():
         score_model_arg,
         default_texture_arg,
         fp_wait_timeout_arg,
+        pose_topic_arg,
+        pose_frame_id_arg,
         bridge_node,
     ])

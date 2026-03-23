@@ -21,7 +21,8 @@ This repository contains **patches and new files** to apply on top of the offici
 │   ├── launch/
 │   │   └── yolo_fp_bridge.launch.py       # Launch file for YOLO→FP bridge
 │   └── scripts/
-│       └── yolo_fp_bridge.py              # YOLO detection → FoundationPose bridge node
+│       ├── yolo_fp_bridge.py              # YOLO detection → FoundationPose bridge node
+│       └── fp_pose_monitor.py             # Real-time 6D pose monitor & validator
 ├── mesh/
 │   └── K2.obj                             # K2 twist-lock mesh (origin-centered, with UV)
 ├── apply_patches.sh                       # One-shot patch apply script
@@ -107,14 +108,35 @@ ros2 launch isaac_ros_foundationpose isaac_ros_foundationpose_tracking.launch.py
 **Full YOLO + FoundationPose pipeline:**
 
 ```bash
-# Terminal 1: YOLO service
+# Terminal 1: YOLO service (already running)
 ros2 run yolo26_seg yolo_node
 
-# Terminal 2: Bridge node
+# Terminal 2: Bridge node (auto-launches FoundationPose when K2 detected)
 ros2 launch isaac_ros_foundationpose yolo_fp_bridge.launch.py \
   mesh_dir:=<path>/mesh \
   class_names:=k2c \
-  class_to_mesh:=k2c:K2
+  class_to_mesh:=k2c:K2 \
+  pose_topic:=/foundationpose/pose
+
+# Terminal 3: Real-time pose monitor
+ros2 run isaac_ros_foundationpose fp_pose_monitor.py
+```
+
+**Motion control subscription:**
+
+The 6D pose is published on `/foundationpose/pose` as `geometry_msgs/PoseStamped`:
+- `frame_id`: camera optical frame (e.g. `right_camera_color_optical_frame`)
+- `pose.position`: object center in camera frame (meters)
+- `pose.orientation`: object orientation as quaternion (x, y, z, w)
+- Source: `/tracking/output` (real-time tracking), fallback to `/pose_estimation/output`
+
+```bash
+# Quick check from motion control side:
+ros2 topic echo /foundationpose/pose
+
+# Or subscribe in Python:
+from geometry_msgs.msg import PoseStamped
+self.create_subscription(PoseStamped, '/foundationpose/pose', callback, 10)
 ```
 
 ---

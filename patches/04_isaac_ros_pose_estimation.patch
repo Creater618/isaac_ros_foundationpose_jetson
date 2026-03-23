@@ -1,13 +1,14 @@
 diff --git a/isaac_ros_foundationpose/CMakeLists.txt b/isaac_ros_foundationpose/CMakeLists.txt
-index 991614d..58d4a59 100644
+index 991614d..ab4776b 100644
 --- a/isaac_ros_foundationpose/CMakeLists.txt
 +++ b/isaac_ros_foundationpose/CMakeLists.txt
-@@ -75,4 +75,9 @@ if(BUILD_TESTING)
+@@ -75,4 +75,10 @@ if(BUILD_TESTING)
    add_launch_test(test/isaac_ros_foundationpose_tracking_pol.py TIMEOUT "900")
  endif()
  
 +install(PROGRAMS
 +  scripts/yolo_fp_bridge.py
++  scripts/fp_pose_monitor.py
 +  DESTINATION lib/${PROJECT_NAME}
 +)
 +
